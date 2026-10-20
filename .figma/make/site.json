@@ -1,0 +1,12 @@
+{
+  "title": "Miséricorde Divine",
+  "language": "fr",
+  "description": "Manage financial activities for members, contributions, donations, and expenses with an intuitive interface, ensuring transparency and efficiency for organizations.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": true,
+    "ignoreReducedMotion": false
+  }
+}

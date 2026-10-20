@@ -1,0 +1,42 @@
+﻿# Local environment files and secrets. Keep safe example templates in Git.
+.env*
+!.env.example
+!**/.env.example
+
+# Dependencies
+node_modules/
+
+# Build output and caches
+dist/
+build/
+coverage/
+.cache/
+.vite/
+*.tsbuildinfo
+vite.config.*.timestamp-*
+
+# Logs and temporary files
+*-debug.log*
+*.log
+logs/
+.claude-replay.*
+.tmp-*
+
+# Uploaded application data
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Figma Make generated local state
+/.figma/design-context/
+/.plugins/
+/.opencode-skills/
