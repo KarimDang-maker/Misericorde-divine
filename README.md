@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Miséricorde Divine
 
 Application de gestion financière : frontend React/Vite et API Express/MySQL.
@@ -45,3 +46,7 @@ Commandes frontend : `npm run build`, `npm run format`. Commandes backend depuis
 - [Architecture frontend](docs/FRONTEND_ARCHITECTURE.md)
 - [Audit d’intégration frontend/API/MySQL](docs/INTEGRATION_AUDIT.md)
 - [Spécification backend](backend.md)
+=======
+# Misericorde-divine
+Plateforme monoutilisateur de gestion de caisse diocésaine 
+>>>>>>> 62bf639854ea45aaa9a2df923028b3909c837d7a
