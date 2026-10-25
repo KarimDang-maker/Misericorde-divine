@@ -5,6 +5,7 @@ import { env } from "../config/environment.js"
 import { one, run, withTransaction } from "../config/database.js"
 import { unauthorized, unprocessable, forbidden } from "../utils/errors.js"
 import { createAuditLog } from "./audit.js"
+import { enqueuePasswordChangedNotification } from "./notifications.js"
 
 const hashToken = (token) => createHash("sha256").update(token).digest("hex")
 
@@ -26,7 +27,7 @@ export const passwordSchema = z
     path: ["nouveauMotDePasse"],
   })
 
-export const publicUser = (user) => ({ id: user.id, email: user.email, nom: user.nom })
+export const publicUser = (user) => ({ id: user.id, email: user.email, nom: user.nom, role: user.role || "gestionnaire" })
 
 export async function login({ email, motDePasse }, meta = {}) {
   const user = await one(null, "SELECT * FROM users WHERE email = ?", [email])
@@ -57,7 +58,7 @@ export async function getCurrentUser(token) {
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return null
   const row = await one(
     null,
-    `SELECT u.id, u.email, u.nom, u.actif FROM sessions s JOIN users u ON u.id = s.user_id
+    `SELECT u.id, u.email, u.nom, u.role, u.actif FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.id = ? AND s.expires_at > UTC_TIMESTAMP()`,
     [hashToken(token)],
   )
@@ -79,6 +80,7 @@ export async function changePassword(userId, { ancienMotDePasse, nouveauMotDePas
       userId,
       currentToken ? hashToken(currentToken) : "",
     ])
+    await enqueuePasswordChangedNotification(conn, user)
     await createAuditLog(conn, { ctx, action: "CHANGE_PASSWORD", entityType: "user", entityId: userId })
     return { updated: true }
   })

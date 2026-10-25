@@ -20,8 +20,8 @@ export function requireActiveAccount(req, _res, next) {
 export function cookieOptions(expiresAt) {
   return {
     httpOnly: true,
-    secure: env.isProduction,
-    sameSite: "lax",
+    secure: env.session.secureCookie,
+    sameSite: env.session.sameSite,
     path: "/",
     ...(expiresAt ? { expires: expiresAt } : {}),
   }

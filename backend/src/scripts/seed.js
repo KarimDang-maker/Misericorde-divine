@@ -41,13 +41,16 @@ export async function seedReferenceData() {
     await run(null, "INSERT INTO financial_accounts (code, nom, type, solde_initial) VALUES ('CAISSE', 'Caisse principale', 'caisse', 0)")
     created.comptes++
   }
-  if (!(await one(null, "SELECT id FROM users WHERE email = ?", [env.seed.email.toLowerCase()]))) {
+  const adminEmail = env.seed.email.toLowerCase()
+  if (!(await one(null, "SELECT id FROM users WHERE email = ?", [adminEmail]))) {
     if (!env.seed.password || env.seed.password.length < 8) {
       throw new Error("SEED_ADMIN_PASSWORD (8 caractères min.) est requis pour créer le compte initial.")
     }
-    await createUser({ email: env.seed.email, nom: env.seed.name, password: env.seed.password })
+    const id = await createUser({ email: adminEmail, nom: env.seed.name, password: env.seed.password })
+    await run(null, "UPDATE users SET role='admin' WHERE id=?", [id])
     created.utilisateur = true
   }
+  await run(null, "UPDATE users SET role='admin' WHERE email=?", [adminEmail])
   return created
 }
 

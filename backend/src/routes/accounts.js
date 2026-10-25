@@ -2,8 +2,10 @@ import { Router } from "express"
 import { validateBody } from "../middlewares/validate.js"
 import {
   accountSchema,
+  accountAdjustmentSchema,
   accountUpdateSchema,
   createAccount,
+  createAccountAdjustment,
   getAccountBalance,
   getAccountById,
   getAccountMovements,
@@ -16,6 +18,7 @@ import { parseId, sendCreated, sendSuccess } from "../utils/http.js"
 import { parsePagination } from "../utils/pagination.js"
 import { idempotent } from "../middlewares/idempotency.js"
 import { z } from "zod"
+import { requireAdmin } from "../middlewares/roles.js"
 
 export const accountsRouter = Router()
 
@@ -37,6 +40,9 @@ accountsRouter.get("/:id/mouvements", async (req, res) => {
   const { items, meta } = await getAccountMovements(parseId(req.params.id), req.query, parsePagination(req.query))
   sendSuccess(res, items, meta)
 })
+accountsRouter.post("/:id/ajustements", requireAdmin, idempotent, validateBody(accountAdjustmentSchema), async (req, res) =>
+  sendCreated(res, await createAccountAdjustment(parseId(req.params.id), req.body, req.ctx)),
+)
 
 export const treasuryRouter = Router()
 treasuryRouter.get("/synthese", async (req, res) => {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { one, run } from "../config/database.js"
 import { conflict, badRequest } from "../utils/errors.js"
 
@@ -15,6 +16,7 @@ export async function idempotent(req, res, next) {
     throw badRequest("IDEMPOTENCY_KEY_INVALIDE", "Idempotency-Key invalide (100 caractères max).")
   }
   const routeId = `${req.method} ${req.baseUrl}${req.route?.path ?? req.path}`
+  const requestHash = createHash("sha256").update(JSON.stringify(req.body ?? null)).digest("hex")
   const lockId = `${req.user.id}:${key}`
 
   const replay = async () => {
@@ -22,6 +24,9 @@ export async function idempotent(req, res, next) {
     if (!stored) return false
     if (stored.route !== routeId) {
       throw conflict("IDEMPOTENCY_KEY_REUTILISEE", "Cette clé d'idempotence a déjà servi pour une autre route.")
+    }
+    if (!stored.request_hash || stored.request_hash !== requestHash) {
+      throw conflict("IDEMPOTENCY_KEY_REUTILISEE", "Cette clé d'idempotence a déjà servi pour une autre requête.")
     }
     const body = typeof stored.corps === "string" ? JSON.parse(stored.corps) : stored.corps
     res.setHeader("Idempotent-Replay", "true")
@@ -56,10 +61,11 @@ export async function idempotent(req, res, next) {
       release()
     }
     if (status >= 200 && status < 300) {
-      run(null, "INSERT IGNORE INTO idempotency_keys (cle, user_id, route, statut_http, corps) VALUES (?, ?, ?, ?, ?)", [
+      run(null, "INSERT IGNORE INTO idempotency_keys (cle, user_id, route, request_hash, statut_http, corps) VALUES (?, ?, ?, ?, ?, ?)", [
         key,
         req.user.id,
         routeId,
+        requestHash,
         status,
         JSON.stringify(body),
       ])

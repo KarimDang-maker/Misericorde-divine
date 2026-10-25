@@ -69,8 +69,8 @@ export function getSessionSecuritySettings() {
   return {
     dureeSessionHeures: env.session.durationHours,
     cookieHttpOnly: true,
-    cookieSecure: env.isProduction,
-    cookieSameSite: "lax",
+    cookieSecure: env.session.secureCookie,
+    cookieSameSite: env.session.sameSite,
     limiteTentativesConnexion: "10 échecs / 15 minutes",
   }
 }

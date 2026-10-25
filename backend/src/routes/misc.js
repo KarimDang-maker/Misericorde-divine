@@ -31,11 +31,13 @@ import {
   diocesanCancelSchema,
   diocesanPeriodSchema,
   diocesanSchema,
+  diocesanUpdateSchema,
   generateDiocesanContribution,
   getDiocesanContributionById,
   getDiocesanSummary,
   getRelatedOperations,
   listDiocesanContributions,
+  updateDiocesanContribution,
 } from "../services/diocese.js"
 import { buildImportTemplate, exportResource, importResource, listExchangeResources } from "../services/exchange.js"
 import { getHelpSection, listHelpSections } from "../services/help.js"
@@ -75,6 +77,9 @@ dioceseRouter.post("/generation", idempotent, validateBody(diocesanPeriodSchema)
   sendCreated(res, await generateDiocesanContribution(req.body, req.ctx)),
 )
 dioceseRouter.get("/:id", async (req, res) => sendSuccess(res, await getDiocesanContributionById(parseId(req.params.id))))
+dioceseRouter.put("/:id", validateBody(diocesanUpdateSchema), async (req, res) =>
+  sendSuccess(res, await updateDiocesanContribution(parseId(req.params.id), req.body, req.ctx)),
+)
 dioceseRouter.get("/:id/operations", async (req, res) => sendSuccess(res, await getRelatedOperations(parseId(req.params.id))))
 dioceseRouter.post("/:id/annulation", validateBody(diocesanCancelSchema), async (req, res) =>
   sendSuccess(res, await cancelDiocesanContribution(parseId(req.params.id), req.body.motif, req.ctx)),
@@ -95,7 +100,7 @@ attachmentsRouter.get("/:id/telechargement", async (req, res) => {
   res.setHeader("Content-Type", file.mimeType)
   res.setHeader("X-Content-Type-Options", "nosniff")
   res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(file.nom)}`)
-  res.sendFile(file.filePath)
+  res.send(file.contents)
 })
 attachmentsRouter.post(
   "/:id/liaison",

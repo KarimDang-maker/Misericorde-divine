@@ -37,13 +37,31 @@ httpClient.interceptors.response.use(
   },
 )
 
-export async function apiGet<T>(path: string, params?: Record<string, unknown>) {
-  const { data } = await httpClient.get<ApiEnvelope<T>>(path, { params })
+export async function apiGet<T>(path: string, params?: Record<string, unknown>, options?: { signal?: AbortSignal }) {
+  const { data } = await httpClient.get<ApiEnvelope<T>>(path, { params, signal: options?.signal })
   return data
 }
+const pendingPostKeys = new Map<string, string>()
+function createIdempotencyKey() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID()
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
 export async function apiPost<T>(path: string, payload?: unknown) {
-  const { data } = await httpClient.post<ApiEnvelope<T>>(path, payload)
-  return data
+  // Réutilise la même clé après une erreur réseau/5xx pour la même intention et son payload.
+  const intent = `${path}:${JSON.stringify(payload ?? null)}`
+  const key = pendingPostKeys.get(intent) ?? createIdempotencyKey()
+  pendingPostKeys.set(intent, key)
+  try {
+    const { data } = await httpClient.post<ApiEnvelope<T>>(path, payload, {
+      headers: { "Idempotency-Key": key },
+    })
+    pendingPostKeys.delete(intent)
+    return data
+  } catch (error) {
+    const status = (error as ApiError).status
+    if (status && status < 500) pendingPostKeys.delete(intent)
+    throw error
+  }
 }
 export async function apiPut<T>(path: string, payload?: unknown) {
   const { data } = await httpClient.put<ApiEnvelope<T>>(path, payload)

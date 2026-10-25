@@ -1,14 +1,15 @@
 import { run } from "../config/database.js"
 
-const SENSITIVE = new Set(["password", "password_hash", "motDePasse", "ancienMotDePasse", "nouveauMotDePasse"])
+const SENSITIVE_KEY = /password|mot.?de.?passe|token|secret|cookie|authorization|api.?key|blob|buffer|contenu.?fichier/i
 
 function scrub(value) {
   if (value === null || value === undefined) return null
-  const copy = {}
-  for (const [key, val] of Object.entries(value)) {
-    if (!SENSITIVE.has(key)) copy[key] = val
+  const sanitize = (item) => {
+    if (Array.isArray(item)) return item.map(sanitize)
+    if (!item || typeof item !== "object") return item
+    return Object.fromEntries(Object.entries(item).map(([key, val]) => [key, SENSITIVE_KEY.test(key) ? "[redacted]" : sanitize(val)]))
   }
-  return JSON.stringify(copy)
+  return JSON.stringify(sanitize(value))
 }
 
 /**

@@ -6,6 +6,7 @@ type StatCardProps = {
   detail: string
   icon: LucideIcon
   tone?: "rose" | "plum" | "blue" | "green"
+  sensitive?: boolean
 }
 
 export function StatCard({
@@ -14,6 +15,7 @@ export function StatCard({
   detail,
   icon: Icon,
   tone = "rose",
+  sensitive = false,
 }: StatCardProps) {
   return (
     <article className="stat-card">
@@ -22,7 +24,7 @@ export function StatCard({
       </div>
       <div className="stat-card__content">
         <p className="stat-card__label">{label}</p>
-        <p className="stat-card__value">{value}</p>
+        <p className={`stat-card__value ${sensitive ? "sensitive-amount" : ""}`}>{value}</p>
         <p className="stat-card__detail">{detail}</p>
       </div>
     </article>

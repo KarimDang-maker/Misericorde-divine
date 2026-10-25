@@ -2,17 +2,35 @@ import "./env.js"
 import fs from "node:fs/promises"
 import mysql from "mysql2/promise"
 import { env } from "../src/config/environment.js"
+import { assertSafeTestTarget, TEST_DATABASE_NAME } from "./safety.js"
 
-if (env.db.name !== "misericorde_divine_test") throw new Error("Garde-fou : les tests ne doivent jamais viser une autre base.")
+assertSafeTestTarget({ nodeEnv: env.nodeEnv, databaseName: env.db.name, host: env.db.host })
 
 export const ADMIN = { email: env.seed.email, motDePasse: "MotDePasseTest123" }
 
-/** Recrée entièrement la base de test puis applique migrations et données de référence. */
+/** Vide uniquement les tables du schéma de test dédié puis applique migrations et données de référence. */
 export async function resetDatabase() {
+  // Revérifie la cible au plus près de l'opération destructive.
+  assertSafeTestTarget({ nodeEnv: env.nodeEnv, databaseName: env.db.name, host: env.db.host })
   const root = await mysql.createConnection({ host: env.db.host, port: env.db.port, user: env.db.rootUser, password: env.db.rootPassword })
-  await root.query(`DROP DATABASE IF EXISTS \`${env.db.name}\``)
-  await root.query(`CREATE DATABASE \`${env.db.name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`)
-  await root.end()
+  try {
+    const databaseName = TEST_DATABASE_NAME
+    await root.query(`CREATE DATABASE IF NOT EXISTS \`${databaseName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci`)
+    await root.query(`USE \`${databaseName}\``)
+    await root.query("SET FOREIGN_KEY_CHECKS = 0")
+    try {
+      const [tables] = await root.query("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
+      for (const row of tables) {
+        const tableName = Object.values(row)[0]
+        const escapedTableName = String(tableName).replace(/`/g, "``")
+        await root.query(`DROP TABLE IF EXISTS \`${escapedTableName}\``)
+      }
+    } finally {
+      await root.query("SET FOREIGN_KEY_CHECKS = 1")
+    }
+  } finally {
+    await root.end()
+  }
   await fs.rm(env.upload.dir, { recursive: true, force: true })
   const { pool } = await import("../src/config/database.js")
   const { runMigrations } = await import("../src/scripts/migrate.js")

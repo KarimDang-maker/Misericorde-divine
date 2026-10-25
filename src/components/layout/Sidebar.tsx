@@ -1,7 +1,8 @@
-import { ChevronLeft, HeartHandshake, X } from "lucide-react"
+import { Bell, ChevronLeft, HeartHandshake, ShieldCheck, X } from "lucide-react"
 import { NavLink } from "react-router"
 import { navigationItems } from "@/config/navigation"
 import { Button } from "@/components/ui/Button"
+import { useAuth } from "@/auth/AuthProvider"
 
 type SidebarProps = {
   open: boolean
@@ -9,6 +10,14 @@ type SidebarProps = {
 }
 
 export function Sidebar({ open, onClose }: SidebarProps) {
+  const { user } = useAuth()
+  const groups = user?.role === "admin" ? [...navigationItems, {
+    label: "Administration",
+    items: [
+      { label: "Utilisateurs", path: "/administration/utilisateurs", icon: ShieldCheck, description: "Gestion des comptes, rôles et accès.", apiDependency: "/api/admin/users" },
+      { label: "Notifications e-mail", path: "/administration/notifications", icon: Bell, description: "Supervision et relance des notifications en échec.", apiDependency: "/api/admin/notifications/outbox" },
+    ],
+  }] : navigationItems
   return (
     <>
       {open && (
@@ -40,7 +49,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         </div>
 
         <nav className="sidebar__nav">
-          {navigationItems.map((group) => (
+          {groups.map((group) => (
             <div className="nav-group" key={group.label}>
               <p className="nav-group__label">{group.label}</p>
               {group.items.map((item) => {

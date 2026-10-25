@@ -50,7 +50,6 @@ export async function runMigrations(pool) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const { pool } = await import("../config/database.js")
-  await createDatabaseIfMissing()
   const executed = await runMigrations(pool)
   console.log(executed.length ? `Migrations appliquées : ${executed.join(", ")}` : "Base déjà à jour.")
   await pool.end()

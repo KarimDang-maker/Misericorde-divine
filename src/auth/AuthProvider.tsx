@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react"
 import { apiGet, apiPost, type ApiError } from "@/api/httpClient"
 
-export type User = { id: number; email: string; nom: string }
+export type User = { id: number; email: string; nom: string; role: "admin" | "gestionnaire" }
 type AuthContextValue = { user: User | null; loading: boolean; error: ApiError | null; login: (email: string, motDePasse: string) => Promise<void>; logout: () => Promise<void>; refresh: () => Promise<void> }
 const AuthContext = createContext<AuthContextValue | null>(null)
 

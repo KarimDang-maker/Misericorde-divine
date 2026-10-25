@@ -2,7 +2,7 @@ import { z } from "zod"
 import { one, rows, run, withTransaction } from "../config/database.js"
 import { conflict, notFound, unprocessable } from "../utils/errors.js"
 import { dateRangeClause, normalizeDateRange, requireDate } from "../utils/dates.js"
-import { fromCents, money, toCents } from "../utils/money.js"
+import { fromCents, money, parsePositiveAmount, toCents } from "../utils/money.js"
 import { likePattern, normalizeSearchTerm, paginationMeta } from "../utils/pagination.js"
 import { createAuditLog } from "./audit.js"
 
@@ -190,6 +190,45 @@ export async function setAccountActive(id, actif, ctx, executor = null) {
 }
 
 export const disableAccount = (id, ctx) => setAccountActive(id, false, ctx)
+
+export const accountAdjustmentSchema = z.object({
+  sens: z.enum(["entree", "sortie"]),
+  montant: z.union([z.string(), z.number()]),
+  dateOperation: z.string().min(1).max(10),
+  motif: z.string().trim().min(10).max(500),
+  justificatifReference: z.string().trim().max(190).nullish().transform((value) => value || null),
+})
+
+/** Ajustement d'inventaire comptable : justification et mouvement sont atomiques et immuables. */
+export async function createAccountAdjustment(accountId, input, ctx) {
+  const data = accountAdjustmentSchema.parse(input)
+  const amount = parsePositiveAmount(data.montant)
+  const dateOperation = requireDate(data.dateOperation, "dateOperation")
+  return withTransaction(async (conn) => {
+    await lockAccounts(conn, [accountId])
+    const account = await one(conn, "SELECT id,actif FROM financial_accounts WHERE id=? FOR UPDATE", [accountId])
+    if (!account) throw notFound("COMPTE_NOT_FOUND", "Le compte demandé est introuvable.")
+    if (!account.actif) throw unprocessable("COMPTE_INACTIF", "Ce compte est désactivé.")
+    const result = await run(conn,
+      `INSERT INTO account_adjustments (account_id,sens,montant,date_operation,motif,justificatif_reference,created_by)
+       VALUES (?,?,?,?,?,?,?)`,
+      [accountId, data.sens, amount, dateOperation, data.motif, data.justificatifReference, ctx?.user?.id],
+    )
+    const id = Number(result.insertId)
+    const reference = `ADJ-${String(id).padStart(10, "0")}`
+    await createFinancialMovement(conn, {
+      accountId, sens: data.sens, montant: amount, dateOperation,
+      sourceType: "ajustement", sourceId: id, nature: "normal", reference,
+      libelle: data.motif, userId: ctx?.user?.id,
+    })
+    const adjustment = {
+      id, compteId: accountId, sens: data.sens, montant: Number(amount), dateOperation,
+      motif: data.motif, justificatifReference: data.justificatifReference, reference,
+    }
+    await createAuditLog(conn, { ctx, action: "CREATE_ADJUSTMENT", entityType: "account_adjustment", entityId: id, after: adjustment })
+    return adjustment
+  })
+}
 
 const movementFromRow = (r) => ({
   id: Number(r.id),

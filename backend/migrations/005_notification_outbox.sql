@@ -1,0 +1,20 @@
+CREATE TABLE notification_outbox (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  event_type VARCHAR(60) NOT NULL,
+  aggregate_type VARCHAR(40) NOT NULL,
+  aggregate_id VARCHAR(40) NOT NULL,
+  recipient VARCHAR(254) NOT NULL,
+  payload JSON NOT NULL,
+  dedupe_key VARCHAR(190) NOT NULL,
+  status ENUM('pending', 'processing', 'sent', 'dead') NOT NULL DEFAULT 'pending',
+  attempts TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  available_at DATETIME NOT NULL,
+  locked_at DATETIME NULL,
+  locked_by VARCHAR(64) NULL,
+  sent_at DATETIME NULL,
+  last_error_code VARCHAR(80) NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_notification_dedupe (dedupe_key),
+  KEY idx_notification_pending (status, available_at, id),
+  KEY idx_notification_lease (status, locked_at)
+) ENGINE=InnoDB;

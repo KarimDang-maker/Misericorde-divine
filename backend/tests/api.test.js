@@ -16,6 +16,22 @@ after(async () => srv.close())
 const q = async (sql, params) => (await srv.pool.query(sql, params))[0]
 
 describe("Authentification et sessions", () => {
+  it("autorise uniquement les origines CORS configurées et accepte leur préflight", async () => {
+    const allowed = await fetch(`${srv.base}/sante`, { headers: { Origin: "http://localhost:5173" } })
+    assert.equal(allowed.headers.get("access-control-allow-origin"), "http://localhost:5173")
+    assert.equal(allowed.headers.get("access-control-allow-credentials"), "true")
+    const preflight = await fetch(`${srv.base}/auth/login`, {
+      method: "OPTIONS",
+      headers: { Origin: "http://localhost:5173", "Access-Control-Request-Method": "POST" },
+    })
+    assert.equal(preflight.status, 204)
+    const rejected = await fetch(`${srv.base}/auth/logout`, {
+      method: "POST",
+      headers: { Origin: "https://hostile.example", "Content-Type": "application/json" },
+      body: "{}",
+    })
+    assert.equal(rejected.status, 403)
+  })
   it("refuse les routes sans session (401)", async () => {
     const anon = new Client(srv.base)
     for (const path of ["/membres", "/dashboard", "/cotisations", "/comptes", "/justificatifs", "/echanges", "/rapports/tresorerie", "/anomalies", "/parametres"]) {
@@ -76,6 +92,12 @@ describe("Authentification et sessions", () => {
     assert.equal((await cl.put("/auth/password", { ancienMotDePasse: "faux", nouveauMotDePasse: "NouveauMotDePasse1" })).status, 422)
     assert.equal((await cl.put("/auth/password", { ancienMotDePasse: ADMIN.motDePasse, nouveauMotDePasse: "court" })).status, 422)
     assert.equal((await cl.put("/auth/password", { ancienMotDePasse: ADMIN.motDePasse, nouveauMotDePasse: "NouveauMotDePasse1" })).status, 200)
+    const [notice] = await q("SELECT event_type, recipient, payload, status FROM notification_outbox WHERE event_type='PASSWORD_CHANGED' ORDER BY id DESC LIMIT 1")
+    assert.equal(notice.recipient, ADMIN.email)
+    assert.equal(notice.status, "pending")
+    const noticePayload = typeof notice.payload === "string" ? JSON.parse(notice.payload) : notice.payload
+    assert.equal(noticePayload.userName, (await q("SELECT nom FROM users WHERE email=?", [ADMIN.email]))[0].nom)
+    assert.equal(JSON.stringify(noticePayload).includes("NouveauMotDePasse1"), false)
     assert.equal((await other.get("/auth/me")).status, 401)
     assert.equal((await cl.get("/auth/me")).status, 200)
     assert.equal((await new Client(srv.base).post("/auth/login", ADMIN)).status, 401)
@@ -146,6 +168,29 @@ describe("Membres : CRUD, unicité, archivage, persistance", () => {
     const refus = await c.post("/cotisations", { membreId: id, rubriqueId: ids.cotisation, compteId: ids.caisse, montant: "10", dateOperation: "2025-01-01" })
     assert.equal(refus.body.error.code, "MEMBRE_ARCHIVE")
   })
+  it("génère des références membre distinctes sous créations concurrentes", async () => {
+    const results = await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        c.post("/membres", { nom: `Concurrent${index}`, prenom: "Test" }),
+      ),
+    )
+    assert.ok(results.every((result) => result.status === 201), results.map((result) => result.status).join(","))
+    const references = results.map((result) => result.body.data.reference)
+    assert.equal(new Set(references).size, 12)
+    assert.ok(references.every((reference) => /^MB-\d{6}$/.test(reference)))
+  })
+  it("renvoie une synthèse financière vide pour un membre sans opération", async () => {
+    const created = await c.post("/membres", { nom: "Sans activité", prenom: "Marie" })
+    const [summary, operations] = await Promise.all([
+      c.get(`/membres/${created.body.data.id}/synthese-financiere`),
+      c.get(`/membres/${created.body.data.id}/operations`),
+    ])
+    assert.equal(summary.body.data.totalGeneral, 0)
+    assert.equal(summary.body.data.cotisations.nombre, 0)
+    assert.equal(summary.body.data.recettes.nombre, 0)
+    assert.equal(summary.body.data.dons.nombre, 0)
+    assert.equal(operations.body.meta.total, 0)
+  })
   it("opérations et synthèse financière d'un membre", async () => {
     await c.post("/cotisations", { membreId: ids.membre, rubriqueId: ids.cotisation, compteId: ids.caisse, montant: "100", dateOperation: "2025-02-01", periode: "2025-02" })
     await c.post("/cotisations", { membreId: ids.membre, rubriqueId: ids.cotisation, compteId: ids.caisse, montant: "50.50", dateOperation: "2025-03-01", periode: "2025-03" })
@@ -172,12 +217,16 @@ describe("Rubriques", () => {
     const id = created.body.data.id
     assert.equal((await c.post("/rubriques/cotisations", { code: "COTISATION-SPECIALE-ETE", libelle: "Doublon" })).status, 409)
     assert.equal((await c.put(`/rubriques/cotisations/${id}`, { libelle: "Cotisation été 2025" })).body.data.libelle, "Cotisation été 2025")
-    await c.post("/cotisations", { membreId: ids.membre, rubriqueId: id, compteId: ids.caisse, montant: "10", dateOperation: "2025-01-01" })
+    const operation = await c.post("/cotisations", { membreId: ids.membre, rubriqueId: id, compteId: ids.caisse, montant: "10", dateOperation: "2025-01-01" })
+    assert.equal(operation.status, 201)
     assert.equal((await c.put(`/rubriques/cotisations/${id}`, { code: "AUTRE-CODE" })).body.error.code, "RUBRIQUE_UTILISEE")
     const list = (await c.get("/rubriques/cotisations")).body.data
     assert.equal(list.find((r) => r.id === id).utilisations, 1)
     assert.equal((await c.patch(`/rubriques/cotisations/${id}/statut`, { actif: false })).body.data.actif, false)
     assert.ok(!(await c.get("/rubriques/cotisations?actif=true")).body.data.some((r) => r.id === id))
+    assert.equal((await c.get(`/cotisations/${operation.body.data.id}`)).body.data.rubrique, "Cotisation été 2025")
+    const refused = await c.post("/cotisations", { membreId: ids.membre, rubriqueId: id, compteId: ids.caisse, montant: "5", dateOperation: "2025-01-02" })
+    assert.equal(refused.body.error.code, "RUBRIQUE_INACTIVE")
     assert.equal((await c.del(`/rubriques/cotisations/${id}`)).status, 404, "pas de suppression physique exposée")
   })
   it("les 4 familles de rubriques sont gérées, les dons ont une nature", async () => {
@@ -261,6 +310,28 @@ describe("Contribution diocésaine", () => {
     assert.equal(calc.montantDu, 300.05)
     assert.equal(calc.resteAVerser, 300.05)
   })
+  it("traite un taux nul comme une règle explicite et respecte les assiettes configurées", async () => {
+    const account = (await c.post("/comptes", { code: "ASSIETTE", nom: "Compte assiette", type: "banque", soldeInitial: "1000" })).body.data.id
+    const period = { dateDebut: "2026-03-01", dateFin: "2026-03-31" }
+    const postOperation = (kind, body) => c.post(`/${kind}`, { compteId: account, dateOperation: "2026-03-01", ...body })
+    await postOperation("cotisations", { membreId: ids.membre, rubriqueId: ids.cotisation, montant: "0.50" })
+    await postOperation("cotisations", { membreId: ids.membre, rubriqueId: ids.cotisation, montant: "0.50", dateOperation: "2026-03-31" })
+    await postOperation("dons", { rubriqueId: ids.don, montant: "0.25" })
+    await postOperation("recettes", { rubriqueId: ids.recette, montant: "1.00" })
+    const cancelled = (await postOperation("cotisations", { membreId: ids.membre, rubriqueId: ids.cotisation, montant: "99" })).body.data
+    await c.post(`/cotisations/${cancelled.id}/annulation`, { motif: "Exclure de l’assiette" })
+    for (const [assiette, expected] of [["cotisations", 1], ["cotisations_dons", 1.25], ["recettes_totales", 2.25]]) {
+      await c.put("/parametres/generaux", { dioceseTaux: 10, dioceseAssiette: assiette })
+      const calc = (await c.post("/contribution-diocesaine/calcul", period)).body.data
+      assert.equal(calc.baseCalcul, expected, assiette)
+      assert.equal(calc.montantDu, Math.round(expected * 10) / 100, assiette)
+    }
+    await c.put("/parametres/generaux", { dioceseTaux: 0 })
+    const zero = (await c.post("/contribution-diocesaine/calcul", period)).body.data
+    assert.equal(zero.taux, 0)
+    assert.equal(zero.montantDu, 0)
+    await c.put("/parametres/generaux", { dioceseTaux: 10, dioceseAssiette: "cotisations" })
+  })
   it("génère, enregistre le mouvement de sortie, empêche le double versement et annule", async () => {
     const period = { dateDebut: "2025-08-01", dateFin: "2025-08-31", compteId: compte, dateOperation: "2025-09-05" }
     const gen = await c.post("/contribution-diocesaine/generation", period)
@@ -282,11 +353,24 @@ describe("Contribution diocésaine", () => {
     assert.equal(await solde(c, compte), 100000 + 3000.5)
     assert.equal((await c.post(`/contribution-diocesaine/${d.id}/annulation`, { motif: "Encore" })).status, 409)
   })
+  it("sérialise les générations concurrentes de la même période", async () => {
+    const period = { dateDebut: "2025-10-01", dateFin: "2025-10-31", compteId: compte, dateOperation: "2025-11-01" }
+    await c.post("/cotisations", { membreId: ids.membre, rubriqueId: ids.cotisation, compteId: compte, montant: "100", dateOperation: "2025-10-15" })
+    const attempts = await Promise.all(Array.from({ length: 2 }, () => c.post("/contribution-diocesaine/generation", period)))
+    assert.equal(attempts.filter((result) => result.status === 201).length, 1)
+    assert.equal(attempts.filter((result) => result.body.error?.code === "RIEN_A_VERSER").length, 1)
+    const [[row]] = await srv.pool.query("SELECT COUNT(*) AS n FROM diocesan_contributions WHERE periode_debut=? AND periode_fin=? AND statut='valide'", [period.dateDebut, period.dateFin])
+    assert.equal(Number(row.n), 1)
+  })
   it("création manuelle, validation de période et de montant", async () => {
     const ok = await c.post("/contribution-diocesaine", { compteId: compte, montant: "500", dateOperation: "2025-09-10", periodeDebut: "2025-07-01", periodeFin: "2025-07-31" })
     assert.equal(ok.status, 201)
     assert.equal((await c.post("/contribution-diocesaine", { compteId: compte, montant: "500", dateOperation: "2025-09-10", periodeDebut: "2025-08-01", periodeFin: "2025-07-31" })).status, 422)
     assert.equal((await c.post("/contribution-diocesaine", { compteId: compte, montant: "0", dateOperation: "2025-09-10", periodeDebut: "2025-07-01", periodeFin: "2025-07-31" })).status, 422)
+    const inactive = (await c.post("/comptes", { code: "DIOC-OFF", nom: "Compte fermé", type: "banque", soldeInitial: "10" })).body.data.id
+    await c.patch(`/comptes/${inactive}/statut`, { actif: false })
+    const refused = await c.post("/contribution-diocesaine", { compteId: inactive, montant: "5", dateOperation: "2025-09-10", periodeDebut: "2025-07-01", periodeFin: "2025-07-31" })
+    assert.equal(refused.body.error.code, "COMPTE_INACTIF")
   })
   it("arrondi commercial : 3 % de 0,50 → 0,02 (0,015 arrondi au supérieur)", async () => {
     const { applyRate } = await import("../src/services/diocese.js")
@@ -316,6 +400,7 @@ describe("Justificatifs", () => {
     assert.deepEqual(att.operations, [{ type: "expense", id: op.id }])
     const [row] = await q("SELECT * FROM attachments WHERE id=?", [att.id])
     assert.match(row.storage_key, /^[a-f0-9]{48}\.pdf$/)
+    assert.equal(row.storage_provider, "local")
     assert.equal(row.sha256.length, 64)
     assert.equal(JSON.stringify(res.body).includes(row.storage_key), false, "le chemin interne n'est jamais exposé")
   })
@@ -323,6 +408,17 @@ describe("Justificatifs", () => {
     assert.equal((await c.get("/justificatifs?q=facture")).body.meta.total, 1)
     assert.equal((await c.get(`/operations/depenses/${op.id}/justificatifs`)).body.data.length, 1)
     assert.equal((await c.get(`/depenses/${op.id}`)).body.data.justificatifs.length, 1)
+  })
+  it("lie un même justificatif aux cinq types d’opération pris en charge", async () => {
+    const contribution = (await c.post("/cotisations", { membreId: ids.membre, rubriqueId: ids.cotisation, compteId: ids.banque, montant: "1", dateOperation: "2025-06-02" })).body.data
+    const revenue = (await c.post("/recettes", { rubriqueId: ids.recette, compteId: ids.banque, montant: "1", dateOperation: "2025-06-02" })).body.data
+    const donation = (await c.post("/dons", { rubriqueId: ids.don, compteId: ids.banque, montant: "1", dateOperation: "2025-06-02" })).body.data
+    const diocesan = (await c.post("/contribution-diocesaine", { compteId: ids.banque, montant: "1", dateOperation: "2025-06-02", periodeDebut: "2025-05-01", periodeFin: "2025-05-31" })).body.data
+    for (const [type, route, id] of [["contribution", "cotisations", contribution.id], ["revenue", "recettes", revenue.id], ["donation", "dons", donation.id], ["diocesan", "contribution-diocesaine", diocesan.id]]) {
+      assert.equal((await c.post(`/justificatifs/${att.id}/liaison`, { operationType: type, operationId: id })).status, 200)
+      assert.equal((await c.get(`/operations/${route}/${id}/justificatifs`)).body.data.length, 1)
+    }
+    assert.equal((await c.get(`/operations/depenses/${op.id}/justificatifs`)).body.data.length, 1)
   })
   it("télécharge le fichier exact avec les en-têtes de sécurité", async () => {
     const res = await c.bytes(`/justificatifs/${att.id}/telechargement`)
@@ -544,8 +640,10 @@ describe("Anomalies", () => {
     const op = (await c.post("/depenses", { rubriqueId: ids.depense, compteId: ids.banque, montant: "3", dateOperation: "2025-06-02" })).body.data
     // Corruption volontaire : on supprime le mouvement directement en base.
     await srv.pool.query("DELETE FROM financial_movements WHERE source_type='expense' AND source_id=?", [op.id])
+    const beforeAnomaly = Number((await q("SELECT COUNT(*) n FROM anomalies WHERE code='OPERATION_SANS_MOUVEMENT' AND entite_id=?", [op.id]))[0].n)
     const run = (await c.post("/anomalies/analyse")).body.data
-    assert.equal(run.creees, first.creees + 1 - first.creees || run.creees, "au moins la nouvelle anomalie")
+    assert.equal(run.creees, 1)
+    assert.equal(beforeAnomaly, 0)
     const list = (await c.get("/anomalies?statut=ouverte")).body.data
     const found = list.find((a) => a.code === "OPERATION_SANS_MOUVEMENT" && a.entiteId === op.id)
     assert.ok(found, "OPERATION_SANS_MOUVEMENT détectée")
@@ -574,6 +672,8 @@ describe("Anomalies", () => {
     const res = await c.post(`/anomalies/${id}/resolution`, { resolution: "Vérifié par le trésorier" })
     assert.equal(res.body.data.statut, "resolue")
     assert.equal(res.body.data.resolution, "Vérifié par le trésorier")
+    assert.equal((await c.patch(`/anomalies/${id}/statut`, { statut: "en_cours", commentaire: "Réouverture manuelle" })).body.data.resolution, null)
+    assert.equal((await c.patch(`/anomalies/${id}/statut`, { statut: "resolue" })).status, 422)
     assert.equal((await c.get("/anomalies/999999")).status, 404)
   })
 })

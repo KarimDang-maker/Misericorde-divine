@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { after, before, describe, it } from "node:test"
 import { baseFixtures, loggedClient, solde, startServer } from "./helpers.js"
+import { createAuditLog } from "../src/services/audit.js"
 
 let srv, c, ids
 
@@ -262,6 +263,34 @@ describe("Idempotence", () => {
     assert.equal(new Set(results.map((r) => r.body.data.id)).size, 1)
     assert.equal(await count("contributions"), before + 1)
   })
+  it("refuse de réutiliser une clé pour une autre route métier", async () => {
+    const key = "cross-route-key"
+    const created = await c.post("/recettes", { rubriqueId: ids.recette, compteId: ids.caisse, montant: "3", dateOperation: "2025-07-03" }, { "Idempotency-Key": key })
+    assert.equal(created.status, 201)
+    const reused = await c.post("/dons", { rubriqueId: ids.don, compteId: ids.caisse, montant: "3", dateOperation: "2025-07-03" }, { "Idempotency-Key": key })
+    assert.equal(reused.status, 409)
+    assert.equal(reused.body.error.code, "IDEMPOTENCY_KEY_REUTILISEE")
+  })
+  it("refuse de réutiliser une clé pour un payload différent sur la même route", async () => {
+    const key = "changed-payload-key"
+    const base = { rubriqueId: ids.recette, compteId: ids.caisse, dateOperation: "2025-07-03" }
+    const created = await c.post("/recettes", { ...base, montant: "3" }, { "Idempotency-Key": key })
+    assert.equal(created.status, 201)
+    const reused = await c.post("/recettes", { ...base, montant: "300" }, { "Idempotency-Key": key })
+    assert.equal(reused.status, 409)
+    assert.equal(reused.body.error.code, "IDEMPOTENCY_KEY_REUTILISEE")
+    assert.equal(await count("revenues", "montant=300"), 0)
+  })
+  it("accepte deux intentions sans clé comme deux opérations indépendantes", async () => {
+    const before = await count("revenues")
+    const payload = { rubriqueId: ids.recette, compteId: ids.caisse, montant: "2", dateOperation: "2025-07-04" }
+    const first = await c.post("/recettes", payload)
+    const second = await c.post("/recettes", payload)
+    assert.equal(first.status, 201)
+    assert.equal(second.status, 201)
+    assert.notEqual(first.body.data.id, second.body.data.id)
+    assert.equal(await count("revenues"), before + 2)
+  })
 })
 
 describe("Dons, recettes, distinction des natures", () => {
@@ -316,6 +345,25 @@ describe("Comptes et mouvements", () => {
     assert.equal((await c.post("/comptes", { code: "HISTO", nom: "Doublon", type: "caisse" })).status, 409)
     assert.equal((await c.post("/comptes", { code: "NEG", nom: "Neg", type: "caisse", soldeInitial: "-5" })).status, 422)
   })
+  it("préserve solde initial et mouvements lors de la modification des métadonnées", async () => {
+    const account = (await c.post("/comptes", { code: "METADATA", nom: "Compte avant", type: "banque", banque: "Banque A", soldeInitial: "125.50" })).body.data
+    await c.post("/recettes", { rubriqueId: ids.recette, compteId: account.id, montant: "10", dateOperation: "2025-01-01" })
+    const updated = await c.put(`/comptes/${account.id}`, { nom: "Compte après", banque: "Banque B", numeroCompte: "12345" })
+    assert.equal(updated.status, 200)
+    assert.equal(updated.body.data.soldeInitial, 125.5)
+    assert.equal(updated.body.data.solde, 135.5)
+    assert.equal((await c.get(`/comptes/${account.id}/mouvements`)).body.meta.total, 1)
+  })
+  it("conserve la consultation d’un compte désactivé mais refuse les nouvelles écritures", async () => {
+    const account = (await c.post("/comptes", { code: "ARCHIVE-ACC", nom: "Compte historique", type: "caisse", soldeInitial: "20" })).body.data
+    const revenue = await c.post("/recettes", { rubriqueId: ids.recette, compteId: account.id, montant: "5", dateOperation: "2025-01-01" })
+    await c.patch(`/comptes/${account.id}/statut`, { actif: false })
+    assert.equal((await c.get(`/comptes/${account.id}/solde`)).body.data.solde, 25)
+    assert.equal((await c.get(`/comptes/${account.id}/mouvements`)).body.meta.total, 1)
+    const refused = await c.post("/recettes", { rubriqueId: ids.recette, compteId: account.id, montant: "1", dateOperation: "2025-01-02" })
+    assert.equal(refused.body.error.code, "COMPTE_INACTIF")
+    assert.equal((await c.get(`/recettes/${revenue.body.data.id}`)).status, 200)
+  })
   it("la synthèse de trésorerie sépare caisse, banque et consolidé", async () => {
     const res = await c.get("/tresorerie/synthese")
     assert.equal(res.status, 200)
@@ -360,5 +408,20 @@ describe("Journal d'audit", () => {
   it("ne journalise jamais de mot de passe", async () => {
     const [rows] = await srv.pool.query("SELECT COUNT(*) n FROM audit_logs WHERE anciennes_valeurs LIKE '%password%' OR nouvelles_valeurs LIKE '%password%' OR nouvelles_valeurs LIKE '%MotDePasse%'")
     assert.equal(Number(rows[0].n), 0)
+  })
+  it("expurge récursivement les secrets et conserve le request ID", async () => {
+    await createAuditLog(null, {
+      ctx: { user: { id: 1 }, requestId: "audit-request-1", ip: "127.0.0.1" },
+      action: "TEST_SCRUB",
+      entityType: "test-scrub",
+      after: { commentaire: "sûr", nested: [{ password_hash: "hash-secret", apiKey: "api-secret", contenuFichier: "bytes", valeur: 2 }] },
+    })
+    const [[log]] = await srv.pool.query("SELECT nouvelles_valeurs, request_id FROM audit_logs WHERE entite_type='test-scrub' ORDER BY id DESC LIMIT 1")
+    const payload = typeof log.nouvelles_valeurs === "string" ? JSON.parse(log.nouvelles_valeurs) : log.nouvelles_valeurs
+    assert.equal(log.request_id, "audit-request-1")
+    assert.equal(payload.commentaire, "sûr")
+    assert.equal(payload.nested[0].password_hash, "[redacted]")
+    assert.equal(payload.nested[0].apiKey, "[redacted]")
+    assert.equal(payload.nested[0].contenuFichier, "[redacted]")
   })
 })

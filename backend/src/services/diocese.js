@@ -6,7 +6,7 @@ import { fromCents, money, parsePositiveAmount, toCents } from "../utils/money.j
 import { likePattern, normalizeSearchTerm, paginationMeta } from "../utils/pagination.js"
 import { nextReference } from "../utils/references.js"
 import { createAuditLog } from "./audit.js"
-import { createFinancialMovement } from "./accounts.js"
+import { createFinancialMovement, lockAccounts } from "./accounts.js"
 import { getGeneralSettings } from "./settings.js"
 import { cancelSchema } from "./operations.js"
 
@@ -21,6 +21,12 @@ export const diocesanSchema = z.object({
   periodeFin: isoDate,
   libelle: z.string().trim().max(255).nullish().transform((v) => v || null),
 })
+export const diocesanUpdateSchema = z.object({
+  compteId: id.optional(),
+  montant: z.union([z.string(), z.number()]).optional(),
+  dateOperation: isoDate.optional(),
+  libelle: z.string().trim().max(255).nullish().transform((v) => v || null).optional(),
+}).strict().refine((value) => Object.keys(value).length > 0, "Au moins un champ doit être fourni.")
 export const diocesanPeriodSchema = z.object({
   dateDebut: isoDate,
   dateFin: isoDate,
@@ -89,7 +95,7 @@ export async function getDiocesanContributionById(contributionId, executor = nul
   return fromRow(row)
 }
 
-export async function createDiocesanContribution(data, ctx, extra = {}) {
+export async function createDiocesanContribution(data, ctx, extra = {}, executor = null) {
   requireDate(data.dateOperation, "dateOperation")
   requireDate(data.periodeDebut, "periodeDebut")
   requireDate(data.periodeFin, "periodeFin")
@@ -97,7 +103,8 @@ export async function createDiocesanContribution(data, ctx, extra = {}) {
     throw unprocessable("PERIODE_INVALIDE", "La période est invalide.", { periodeDebut: "Postérieure à la fin" })
   }
   const montant = parsePositiveAmount(data.montant)
-  return withTransaction(async (conn) => {
+  const work = async (conn) => {
+    await lockDiocesanPeriod(conn, data.periodeDebut, data.periodeFin)
     const account = await one(conn, "SELECT id, actif FROM financial_accounts WHERE id = ?", [data.compteId])
     if (!account) throw unprocessable("COMPTE_NOT_FOUND", "Le compte est introuvable.", { compteId: "Introuvable" })
     if (!account.actif) throw unprocessable("COMPTE_INACTIF", "Le compte est désactivé.", { compteId: "Désactivé" })
@@ -138,7 +145,18 @@ export async function createDiocesanContribution(data, ctx, extra = {}) {
     const created = await getDiocesanContributionById(inserted.insertId, conn)
     await createAuditLog(conn, { ctx, action: "CREATE", entityType: "diocesan", entityId: created.id, after: created })
     return created
-  })
+  }
+  return executor ? work(executor) : withTransaction(work)
+}
+
+async function lockDiocesanPeriod(conn, dateDebut, dateFin) {
+  await run(
+    conn,
+    `INSERT INTO diocesan_generation_locks (periode_debut, periode_fin) VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE periode_fin = VALUES(periode_fin)`,
+    [dateDebut, dateFin],
+  )
+  await one(conn, "SELECT periode_debut FROM diocesan_generation_locks WHERE periode_debut = ? AND periode_fin = ? FOR UPDATE", [dateDebut, dateFin])
 }
 
 export async function cancelDiocesanContribution(contributionId, motif, ctx) {
@@ -175,13 +193,66 @@ export async function cancelDiocesanContribution(contributionId, motif, ctx) {
   })
 }
 
+/**
+ * Corrige une contribution valide sans effacer ses mouvements : inverse l’écriture
+ * précédente à la date du jour puis inscrit le mouvement corrigé dans la même transaction.
+ * Les bornes de la période et les données de calcul restent immuables.
+ */
+export async function updateDiocesanContribution(contributionId, patch, ctx) {
+  const input = diocesanUpdateSchema.parse(patch)
+  return withTransaction(async (conn) => {
+    const locked = await one(conn, "SELECT id,statut FROM diocesan_contributions WHERE id=? FOR UPDATE", [contributionId])
+    if (!locked) throw notFound("DIOCESE_NOT_FOUND", "La contribution diocésaine est introuvable.")
+    if (locked.statut !== "valide") throw conflict("OPERATION_ANNULEE", "Une contribution annulée ne peut plus être modifiée.")
+
+    const before = await getDiocesanContributionById(contributionId, conn)
+    const merged = {
+      ...before,
+      ...input,
+      compteId: input.compteId ?? before.compteId,
+      montant: parsePositiveAmount(input.montant ?? before.montant),
+      dateOperation: input.dateOperation ?? before.dateOperation,
+      libelle: input.libelle === undefined ? before.libelle : input.libelle,
+    }
+    requireDate(merged.dateOperation, "dateOperation")
+    await lockDiocesanPeriod(conn, before.periodeDebut, before.periodeFin)
+    await lockAccounts(conn, [before.compteId, merged.compteId])
+    const account = await one(conn, "SELECT id,actif FROM financial_accounts WHERE id=?", [merged.compteId])
+    if (!account) throw unprocessable("COMPTE_NOT_FOUND", "Le compte est introuvable.", { compteId: "Introuvable" })
+    if (!account.actif) throw unprocessable("COMPTE_INACTIF", "Le compte est désactivé.", { compteId: "Désactivé" })
+
+    await run(conn,
+      "UPDATE diocesan_contributions SET account_id=?,montant=?,date_operation=?,libelle=? WHERE id=?",
+      [merged.compteId, merged.montant, merged.dateOperation, merged.libelle, contributionId],
+    )
+    await createFinancialMovement(conn, {
+      accountId: before.compteId, sens: "entree", montant: parsePositiveAmount(before.montant),
+      dateOperation: today(), sourceType: "diocesan", sourceId: contributionId, nature: "contre_ecriture",
+      reference: before.reference, libelle: "Contre-écriture de correction diocésaine", userId: ctx?.user?.id,
+    })
+    await createFinancialMovement(conn, {
+      accountId: merged.compteId, sens: "sortie", montant: merged.montant,
+      dateOperation: merged.dateOperation, sourceType: "diocesan", sourceId: contributionId,
+      reference: before.reference, libelle: merged.libelle ?? "Contribution diocésaine corrigée", userId: ctx?.user?.id,
+    })
+    await run(conn,
+      `INSERT INTO operation_status_history (operation_type,operation_id,ancien_statut,nouveau_statut,motif,user_id)
+       VALUES ('diocesan',?,'valide','valide','Correction de contribution',?)`,
+      [contributionId, ctx?.user?.id ?? null],
+    )
+    const after = await getDiocesanContributionById(contributionId, conn)
+    await createAuditLog(conn, { ctx, action: "UPDATE", entityType: "diocesan", entityId: contributionId, before, after })
+    return after
+  })
+}
+
 /** Somme des opérations valides entrant dans l'assiette configurée sur la période (bornes incluses). */
-async function computeBase(assiette, range) {
+async function computeBase(assiette, range, executor = null) {
   const sum = async (table) => {
     const where = ["statut = 'valide'"]
     const params = []
     dateRangeClause("date_operation", range, where, params)
-    const row = await one(null, `SELECT COALESCE(SUM(montant),0) AS total FROM ${table} WHERE ${where.join(" AND ")}`, params)
+    const row = await one(executor, `SELECT COALESCE(SUM(montant),0) AS total FROM ${table} WHERE ${where.join(" AND ")}`, params)
     return toCents(row.total)
   }
   const tables = {
@@ -202,22 +273,22 @@ export function applyRate(baseCents, tauxPercent) {
   return Number((numerator + divisor / 2n) / divisor)
 }
 
-export async function calculateDiocesanContribution(period) {
+export async function calculateDiocesanContribution(period, executor = null) {
   const range = normalizeDateRange(period.dateDebut, period.dateFin)
   if (!range.dateDebut || !range.dateFin) {
     throw unprocessable("PERIODE_REQUISE", "La période (début et fin) est obligatoire.", { dateDebut: "Obligatoire" })
   }
-  const settings = await getGeneralSettings()
+  const settings = await getGeneralSettings(executor)
   if (settings.dioceseTaux === null || !settings.dioceseAssiette) {
     throw unprocessable(
       "REGLE_DIOCESAINE_NON_CONFIGUREE",
       "Le taux et l'assiette de la contribution diocésaine doivent d'abord être configurés dans les paramètres.",
     )
   }
-  const baseCents = await computeBase(settings.dioceseAssiette, range)
+  const baseCents = await computeBase(settings.dioceseAssiette, range, executor)
   const dueCents = applyRate(baseCents, settings.dioceseTaux)
   const paid = await one(
-    null,
+    executor,
     `SELECT COALESCE(SUM(montant),0) AS total FROM diocesan_contributions
      WHERE statut = 'valide' AND periode_debut = ? AND periode_fin = ?`,
     [range.dateDebut, range.dateFin],
@@ -235,26 +306,30 @@ export async function calculateDiocesanContribution(period) {
 }
 
 export async function generateDiocesanContribution(period, ctx) {
-  const calc = await calculateDiocesanContribution(period)
-  if (calc.resteAVerser <= 0) {
-    throw unprocessable("RIEN_A_VERSER", "Aucun montant restant à verser pour cette période.")
-  }
-  if (!period.compteId) {
-    throw unprocessable("COMPTE_REQUIS", "Le compte de paiement est obligatoire.", { compteId: "Obligatoire" })
-  }
-  const created = await createDiocesanContribution(
-    {
-      compteId: period.compteId,
-      montant: calc.resteAVerser,
-      dateOperation: period.dateOperation ?? today(),
-      periodeDebut: calc.periode.dateDebut,
-      periodeFin: calc.periode.dateFin,
-      libelle: `Contribution diocésaine ${calc.periode.dateDebut} → ${calc.periode.dateFin}`,
-    },
-    ctx,
-    { assiette: calc.baseCalcul, taux: calc.taux },
-  )
-  return { contribution: created, calcul: calc }
+  return withTransaction(async (conn) => {
+    await lockDiocesanPeriod(conn, period.dateDebut, period.dateFin)
+    const calc = await calculateDiocesanContribution(period, conn)
+    if (calc.resteAVerser <= 0) {
+      throw unprocessable("RIEN_A_VERSER", "Aucun montant restant à verser pour cette période.")
+    }
+    if (!period.compteId) {
+      throw unprocessable("COMPTE_REQUIS", "Le compte de paiement est obligatoire.", { compteId: "Obligatoire" })
+    }
+    const created = await createDiocesanContribution(
+      {
+        compteId: period.compteId,
+        montant: calc.resteAVerser,
+        dateOperation: period.dateOperation ?? today(),
+        periodeDebut: calc.periode.dateDebut,
+        periodeFin: calc.periode.dateFin,
+        libelle: `Contribution diocésaine ${calc.periode.dateDebut} → ${calc.periode.dateFin}`,
+      },
+      ctx,
+      { assiette: calc.baseCalcul, taux: calc.taux },
+      conn,
+    )
+    return { contribution: created, calcul: calc }
+  })
 }
 
 export async function getDiocesanSummary(filters = {}) {

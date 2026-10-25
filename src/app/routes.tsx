@@ -5,13 +5,17 @@ import { NotFoundPage } from "@/pages/shared/NotFoundPage"
 import { navigationItems } from "@/config/navigation"
 import { LoginPage } from "@/pages/auth/LoginPage"
 import { CategoryPage } from "@/pages/categories/CategoryPage"
+import { PasswordResetPage } from "@/pages/auth/PasswordResetPage"
+import { AdminUsersPage } from "@/pages/shared/AdminUsersPage"
+import { GlobalSearchPage } from "@/pages/shared/GlobalSearchPage"
+import { NotificationOutboxPage } from "@/pages/shared/NotificationOutboxPage"
 
 const moduleRoutes = navigationItems
   .flatMap((group) => group.items)
   .filter((item) => item.path !== "/")
   .map((item) => ({
     path: item.path.slice(1),
-    element: item.path === "/rubriques" ? <CategoryPage /> : (
+    element: item.path === "/rubriques" ? <CategoryPage /> : item.path === "/recherche" ? <GlobalSearchPage /> : (
       <ResourcePage
         title={item.label}
         description={item.description}
@@ -22,6 +26,8 @@ const moduleRoutes = navigationItems
 
 export const router = createBrowserRouter([
   { path: "/connexion", Component: LoginPage },
+  { path: "/mot-de-passe-oublie", element: <PasswordResetPage /> },
+  { path: "/reinitialiser-mot-de-passe", element: <PasswordResetPage confirm /> },
   {
     path: "/",
     Component: AppShell,
@@ -36,6 +42,8 @@ export const router = createBrowserRouter([
         },
       },
       ...moduleRoutes,
+      { path: "administration/utilisateurs", Component: AdminUsersPage },
+      { path: "administration/notifications", Component: NotificationOutboxPage },
       { path: "*", Component: NotFoundPage },
     ],
   },

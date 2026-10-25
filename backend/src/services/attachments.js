@@ -1,11 +1,11 @@
 import { createHash, randomBytes } from "node:crypto"
-import fs from "node:fs/promises"
 import path from "node:path"
 import { env } from "../config/environment.js"
 import { one, rows, run, withTransaction } from "../config/database.js"
 import { AppError, notFound, unprocessable } from "../utils/errors.js"
 import { likePattern, normalizeSearchTerm, paginationMeta } from "../utils/pagination.js"
 import { createAuditLog } from "./audit.js"
+import { getAttachmentStorage } from "../storage/index.js"
 
 /** Types d'opération rattachables (segment d'URL → type + table). */
 export const ATTACHABLE = {
@@ -80,17 +80,21 @@ export async function uploadAttachment(file, metadata, ctx) {
   }
   const storageKey = `${randomBytes(24).toString("hex")}${rule.ext}`
   const sha256 = createHash("sha256").update(file.buffer).digest("hex")
-  await fs.mkdir(env.upload.dir, { recursive: true })
-  const target = path.join(env.upload.dir, storageKey)
-  await fs.writeFile(target, file.buffer, { flag: "wx" })
+  const storageProvider = env.upload.storageProvider
+  const storage = await getAttachmentStorage(storageProvider)
+  try {
+    await storage.put(storageKey, file.buffer, file.mimetype)
+  } catch {
+    throw new AppError(503, "STOCKAGE_INDISPONIBLE", "Le fichier n’a pas pu être enregistré dans le stockage.")
+  }
   try {
     return await withTransaction(async (conn) => {
       const originalName = path.basename(file.originalname || "justificatif").replace(/[\r\n"]/g, "_").slice(0, 255)
       const inserted = await run(
         conn,
-        `INSERT INTO attachments (storage_key, nom_original, mime_type, taille, sha256, description, uploaded_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [storageKey, originalName, file.mimetype, file.size, sha256, metadata.description || null, ctx?.user?.id ?? null],
+        `INSERT INTO attachments (storage_key, storage_provider, nom_original, mime_type, taille, sha256, description, uploaded_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [storageKey, storageProvider, originalName, file.mimetype, file.size, sha256, metadata.description || null, ctx?.user?.id ?? null],
       )
       if (metadata.operationType && metadata.operationId) {
         await linkAttachmentToOperation(inserted.insertId, metadata.operationType, Number(metadata.operationId), ctx, conn)
@@ -100,7 +104,7 @@ export async function uploadAttachment(file, metadata, ctx) {
       return created
     })
   } catch (error) {
-    await fs.unlink(target).catch(() => {})
+    await storage.delete(storageKey).catch(() => {})
     throw error
   }
 }
@@ -150,27 +154,43 @@ export async function listOperationAttachments(operationType, operationId) {
   return list.map(fromRow)
 }
 
-/** Retourne le chemin physique pour un flux contrôlé : il n'est jamais exposé au client. */
+/** Récupère les octets via le fournisseur privé après vérification des droits par la route. */
 export async function downloadAttachment(id, ctx) {
   const row = await one(null, "SELECT * FROM attachments WHERE id = ?", [id])
   if (!row) throw notFound("JUSTIFICATIF_NOT_FOUND", "Le justificatif est introuvable.")
-  const filePath = path.join(env.upload.dir, row.storage_key)
+  const storage = await getAttachmentStorage(row.storage_provider || "local")
+  let contents
   try {
-    await fs.access(filePath)
+    contents = await storage.get(row.storage_key)
   } catch {
-    throw notFound("FICHIER_INTROUVABLE", "Le fichier du justificatif est introuvable sur le serveur.")
+    throw new AppError(503, "STOCKAGE_INDISPONIBLE", "Le fichier ne peut pas être récupéré depuis le stockage.")
   }
+  if (!contents) throw notFound("FICHIER_INTROUVABLE", "Le fichier du justificatif est introuvable dans le stockage.")
   await createAuditLog(null, { ctx, action: "DOWNLOAD", entityType: "attachment", entityId: id })
-  return { filePath, nom: row.nom_original, mimeType: row.mime_type }
+  return { contents, nom: row.nom_original, mimeType: row.mime_type }
 }
 
 export async function deleteAttachment(id, ctx) {
   const row = await one(null, "SELECT * FROM attachments WHERE id = ?", [id])
   if (!row) throw notFound("JUSTIFICATIF_NOT_FOUND", "Le justificatif est introuvable.")
   const before = await getAttachmentById(id)
-  await withTransaction(async (conn) => {
-    await run(conn, "DELETE FROM attachments WHERE id = ?", [id])
-    await createAuditLog(conn, { ctx, action: "DELETE", entityType: "attachment", entityId: id, before })
-  })
-  await fs.unlink(path.join(env.upload.dir, row.storage_key)).catch(() => {})
+  const storage = await getAttachmentStorage(row.storage_provider || "local")
+  let contents
+  try {
+    contents = await storage.get(row.storage_key)
+    if (!contents) throw notFound("FICHIER_INTROUVABLE", "Le fichier du justificatif est introuvable dans le stockage.")
+    await storage.delete(row.storage_key)
+  } catch (error) {
+    if (error.status) throw error
+    throw new AppError(503, "STOCKAGE_INDISPONIBLE", "Le fichier n’a pas pu être supprimé du stockage.")
+  }
+  try {
+    await withTransaction(async (conn) => {
+      await run(conn, "DELETE FROM attachments WHERE id = ?", [id])
+      await createAuditLog(conn, { ctx, action: "DELETE", entityType: "attachment", entityId: id, before })
+    })
+  } catch (error) {
+    await storage.put(row.storage_key, contents, row.mime_type).catch(() => {})
+    throw error
+  }
 }

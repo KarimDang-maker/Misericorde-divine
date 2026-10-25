@@ -10,6 +10,7 @@ export function createDatabasePool(overrides = {}) {
     user: env.db.user,
     password: env.db.password,
     connectionLimit: env.db.connectionLimit,
+    ...(env.db.ssl ? { ssl: env.db.ssl } : {}),
     charset: "utf8mb4",
     timezone: "Z",
     dateStrings: true,

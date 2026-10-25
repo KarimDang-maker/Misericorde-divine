@@ -47,3 +47,13 @@ export const rateLimitAuthentication = rateLimit({
   handler: (req, res) =>
     sendError(res, 429, "TROP_DE_TENTATIVES", "Trop de tentatives de connexion. Réessayez plus tard.", {}, req.id),
 })
+
+export const rateLimitPasswordReset = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: env.nodeEnv === "test" ? 1000 : 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: false,
+  handler: (req, res) =>
+    sendError(res, 429, "TROP_DE_TENTATIVES", "Trop de tentatives. Réessayez plus tard.", {}, req.id),
+})

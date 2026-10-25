@@ -9,6 +9,10 @@ export const ANOMALY_STATUSES = ["ouverte", "en_cours", "resolue", "ignoree"]
 export const anomalyStatusSchema = z.object({
   statut: z.enum(ANOMALY_STATUSES),
   commentaire: z.string().trim().max(500).nullish().transform((v) => v || null),
+}).superRefine((value, ctx) => {
+  if (value.statut === "resolue" && !value.commentaire) {
+    ctx.addIssue({ code: "custom", path: ["commentaire"], message: "Une résolution doit être expliquée." })
+  }
 })
 export const anomalyResolutionSchema = z.object({ resolution: z.string().trim().min(3, "Obligatoire").max(500) })
 
@@ -226,8 +230,10 @@ export async function updateAnomalyStatus(id, statut, commentaire, ctx) {
     const row = await one(conn, "SELECT * FROM anomalies WHERE id = ? FOR UPDATE", [id])
     if (!row) throw notFound("ANOMALIE_NOT_FOUND", "L'anomalie est introuvable.")
     if (row.statut === statut) throw conflict("STATUT_INCHANGE", "L'anomalie a déjà ce statut.")
-    await run(conn, "UPDATE anomalies SET statut = ?, resolue_le = ? WHERE id = ?", [
+    await run(conn, "UPDATE anomalies SET statut = ?, resolution = CASE WHEN ?='resolue' THEN ? ELSE NULL END, resolue_le = ? WHERE id = ?", [
       statut,
+      statut,
+      statut === "resolue" ? commentaire : null,
       statut === "resolue" ? new Date().toISOString().slice(0, 19).replace("T", " ") : null,
       id,
     ])
@@ -244,7 +250,25 @@ export async function updateAnomalyStatus(id, statut, commentaire, ctx) {
 }
 
 export async function resolveAnomaly(id, resolution, ctx) {
-  const updated = await updateAnomalyStatus(id, "resolue", resolution, ctx)
-  await run(null, "UPDATE anomalies SET resolution = ? WHERE id = ?", [resolution, id])
-  return { ...updated, resolution }
+  return withTransaction(async (conn) => {
+    const row = await one(conn, "SELECT * FROM anomalies WHERE id = ? FOR UPDATE", [id])
+    if (!row) throw notFound("ANOMALIE_NOT_FOUND", "L'anomalie est introuvable.")
+    if (row.statut === "resolue") throw conflict("STATUT_INCHANGE", "L'anomalie est déjà résolue.")
+    await run(conn, "UPDATE anomalies SET statut='resolue', resolution=?, resolue_le=UTC_TIMESTAMP() WHERE id=?", [resolution, id])
+    await run(conn, "INSERT INTO anomaly_history (anomaly_id, ancien_statut, nouveau_statut, commentaire, user_id) VALUES (?, ?, 'resolue', ?, ?)", [
+      id,
+      row.statut,
+      resolution,
+      ctx?.user?.id ?? null,
+    ])
+    await createAuditLog(conn, {
+      ctx,
+      action: "RESOLVE",
+      entityType: "anomaly",
+      entityId: id,
+      before: { statut: row.statut, resolution: row.resolution },
+      after: { statut: "resolue", resolution },
+    })
+    return getAnomalyById(id, conn)
+  })
 }

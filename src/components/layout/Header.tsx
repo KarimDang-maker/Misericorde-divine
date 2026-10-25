@@ -14,6 +14,7 @@ export function Header({ onMenuOpen }: HeaderProps) {
   const currentItem = navigationItems
     .flatMap((group) => group.items)
     .find((item) => item.path === location.pathname)
+  const pageTitle = currentItem?.label ?? (location.pathname === "/administration/utilisateurs" ? "Utilisateurs" : location.pathname === "/administration/notifications" ? "Notifications e-mail" : "Page introuvable")
 
   return (
     <header className="topbar">
@@ -27,7 +28,7 @@ export function Header({ onMenuOpen }: HeaderProps) {
         />
         <div>
           <p className="topbar__eyebrow">Espace de gestion</p>
-          <h1>{currentItem?.label ?? "Page introuvable"}</h1>
+          <h1>{pageTitle}</h1>
         </div>
       </div>
 
