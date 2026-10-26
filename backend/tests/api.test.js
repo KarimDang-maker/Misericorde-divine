@@ -3,6 +3,7 @@ import { Readable } from "node:stream"
 import { after, before, describe, it } from "node:test"
 import ExcelJS from "exceljs"
 import { ADMIN, baseFixtures, Client, loggedClient, solde, startServer } from "./helpers.js"
+import { runMigrations } from "../src/scripts/migrate.js"
 
 let srv, c, ids
 
@@ -14,6 +15,34 @@ before(async () => {
 after(async () => srv.close())
 
 const q = async (sql, params) => (await srv.pool.query(sql, params))[0]
+
+describe("Initialisation idempotente du schéma", () => {
+  it("sérialise deux démarrages concurrents et reprend une migration partiellement marquée sans doublonner les colonnes", async () => {
+    const databaseName = "misericorde_divine_test"
+    const results = await Promise.all([
+      runMigrations(srv.pool, { databaseName }),
+      runMigrations(srv.pool, { databaseName }),
+    ])
+    assert.deepEqual(results, [[], []])
+
+    // Simule un crash après l’ALTER DDL mais avant l’écriture du registre.
+    await srv.pool.query("DELETE FROM schema_migrations WHERE nom = ?", ["002_idempotency_request_hash.sql"])
+    assert.deepEqual(await runMigrations(srv.pool, { databaseName }), ["002_idempotency_request_hash.sql"])
+    const [columns] = await srv.pool.query(
+      "SELECT COUNT(*) AS total FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+      ["idempotency_keys", "request_hash"],
+    )
+    assert.equal(Number(columns[0].total), 1)
+  })
+
+  it("revalide les tables existantes sans les recréer ni effacer leurs données", async () => {
+    const before = Number((await q("SELECT COUNT(*) AS total FROM members"))[0].total)
+    await srv.pool.query("DELETE FROM schema_migrations WHERE nom = ?", ["001_init.sql"])
+    assert.deepEqual(await runMigrations(srv.pool, { databaseName: "misericorde_divine_test" }), ["001_init.sql"])
+    const after = Number((await q("SELECT COUNT(*) AS total FROM members"))[0].total)
+    assert.equal(after, before)
+  })
+})
 
 describe("Authentification et sessions", () => {
   it("autorise uniquement les origines CORS configurées et accepte leur préflight", async () => {

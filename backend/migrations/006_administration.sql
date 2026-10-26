@@ -1,5 +1,7 @@
 ALTER TABLE users
-  ADD COLUMN role ENUM('admin', 'gestionnaire') NOT NULL DEFAULT 'gestionnaire' AFTER nom,
+  ADD COLUMN role ENUM('admin', 'gestionnaire') NOT NULL DEFAULT 'gestionnaire' AFTER nom;
+
+ALTER TABLE users
   ADD KEY idx_users_role_active (role, actif);
 
 CREATE TABLE password_reset_tokens (
